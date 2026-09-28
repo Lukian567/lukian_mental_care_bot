@@ -4,18 +4,42 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 
 from bot.config import settings
 from bot.db.base import Base, engine
-import bot.db.models  # регистрирует таблицы
-from bot.routers import evening, morning
+import bot.db.models
+from bot.routers import common, morning, evening
 from bot.scheduler import setup_scheduler
 
 
 async def init_db() -> None:
-    """Создаем таблицы в базе, если они отсутствуют."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+async def set_bot_commands(bot: Bot) -> None:
+    """Реєструє системне меню команд Telegram (кнопка Menu і список при вводі /)."""
+    # Базові команди для всіх користувачів
+    commands = [
+        BotCommand(command="start", description="Головне меню"),
+        BotCommand(command="morning", description="Ранковий чекін"),
+        BotCommand(command="evening", description="Вечірній чекін"),
+        BotCommand(command="stats", description="Статистика за 7 днів"),
+        BotCommand(command="cancel", description="Скасувати поточне опитування"),
+        BotCommand(command="help", description="Довідка по боту"),
+    ]
+    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+
+    # Додаткова адмінська команда для твого чату
+    if settings.admin_user_id:
+        admin_commands = commands + [
+            BotCommand(command="export", description="📥 Експорт бази в CSV"),
+        ]
+        await bot.set_my_commands(
+            admin_commands,
+            scope=BotCommandScopeChat(chat_id=int(settings.admin_user_id)),
+        )
 
 
 async def main() -> None:
@@ -24,7 +48,7 @@ async def main() -> None:
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     )
 
-    logging.info("Проверяем структуру базы данных...")
+    logging.info("Перевіряємо структуру бази даних...")
     await init_db()
 
     bot = Bot(
@@ -33,16 +57,19 @@ async def main() -> None:
     )
     dp = Dispatcher()
 
-    # Подключаем роутеры команд
+    # Реєстрація роутерів (common обов'язково першим, щоб перехоплювати /cancel)
+    dp.include_router(common.router)
     dp.include_router(morning.router)
     dp.include_router(evening.router)
 
-    # Инициализируем и запускаем фоновый планировщик
-    scheduler = setup_scheduler(bot, dp.storage)
-    scheduler.start()
-    logging.info("Планировщик APScheduler успешно запущен.")
+    # Налаштовуємо спливаюче меню команд
+    await set_bot_commands(bot)
 
-    logging.info("Бот готов к работе и ожидает сообщений...")
+    # Запуск фонового планувальника нагадувань
+    scheduler = setup_scheduler(bot, dp)
+    scheduler.start()
+
+    logging.info("Бот готовий до роботи. Запускаємо polling...")
     try:
         await dp.start_polling(bot)
     finally:

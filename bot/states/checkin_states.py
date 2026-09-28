@@ -19,3 +19,6 @@ class EveningCheckin(StatesGroup):
     emotion = State()            # Переважна емоція
     emotion_intensity = State()  # Інтенсивність емоції (1-5)
     compassion = State()         # Самопідтримка / що сказав би другу
+
+class ResetData(StatesGroup):
+    confirm = State()

@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from aiogram import Router, F
@@ -20,6 +21,7 @@ from bot.keyboards.checkin_kb import (
 from bot.states.checkin_states import EveningCheckin
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 
 # 1. Старт чекіну (/evening) -> Факт дня
@@ -184,7 +186,7 @@ async def process_emotion_intensity(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# 8. Самопідтримка (кнопка) -> Збереження в БД
+# 8. Фінал: Самопідтримка (кнопка) -> Збереження та ВИДАЛЕННЯ кнопок
 @router.callback_query(EveningCheckin.compassion, F.data.startswith("comp:"))
 async def process_compassion_btn(callback: CallbackQuery, state: FSMContext):
     action = callback.data.split(":")[1]
@@ -202,30 +204,49 @@ async def process_compassion_btn(callback: CallbackQuery, state: FSMContext):
         "skip": "Пропущено",
     }
     await state.update_data(compassion=comp_map.get(action, action))
-    await complete_evening_checkin(callback.message, callback.from_user.id, state)
     await callback.answer()
 
+    # Зберігаємо в базу і ПЕРЕПИСУЄМО повідомлення, щоб кнопки зникли!
+    try:
+        data = await state.get_data()
+        today = datetime.now(ZoneInfo(settings.timezone)).date()
 
-# 8а. Самопідтримка (текстом) -> Збереження в БД
+        async with async_session() as session:
+            await save_checkin(
+                session=session,
+                user_id=callback.from_user.id,
+                checkin_date=today,
+                period="evening",
+                data=data,
+            )
+
+        await state.clear()
+        # Ось тут замість answer використовуємо edit_text
+        await callback.message.edit_text(stubs.EVENING_COMPLETE_MSG)
+    except Exception as e:
+        logger.exception("Помилка збереження вечірнього чекіну: %s", e)
+        await callback.message.answer(f"Помилка при збереженні: {e}")
+
+
+# 8а. Фінал: Самопідтримка (якщо введено вручну текстом)
 @router.message(EveningCheckin.compassion)
 async def process_compassion_text(message: Message, state: FSMContext):
     await state.update_data(compassion=message.text)
-    await complete_evening_checkin(message, message.from_user.id, state)
+    try:
+        data = await state.get_data()
+        today = datetime.now(ZoneInfo(settings.timezone)).date()
 
+        async with async_session() as session:
+            await save_checkin(
+                session=session,
+                user_id=message.from_user.id,
+                checkin_date=today,
+                period="evening",
+                data=data,
+            )
 
-# Допоміжна функція фіксації запису
-async def complete_evening_checkin(message: Message, user_id: int, state: FSMContext):
-    data = await state.get_data()
-    today = datetime.now(ZoneInfo(settings.timezone)).date()
-
-    async with async_session() as session:
-        await save_checkin(
-            session=session,
-            user_id=user_id,
-            checkin_date=today,
-            period="evening",
-            data=data,
-        )
-
-    await state.clear()
-    await message.answer(stubs.EVENING_COMPLETE_MSG)
+        await state.clear()
+        await message.answer(stubs.EVENING_COMPLETE_MSG)
+    except Exception as e:
+        logger.exception("Помилка збереження вечірнього чекіну: %s", e)
+        await message.answer(f"Помилка при збереженні: {e}")
