@@ -1,4 +1,3 @@
-import os
 import re
 from datetime import date
 from typing import Union, Optional
@@ -44,20 +43,8 @@ router = Router()
 
 
 def is_admin_user(user_id: int) -> bool:
-    """Перевірка адміністратора: підтримує ADMIN_USER_ID та ADMIN_ID."""
-    admin_candidates = [
-        getattr(settings, "ADMIN_USER_ID", None),
-        getattr(settings, "admin_user_id", None),
-        getattr(settings, "ADMIN_ID", None),
-        getattr(settings, "admin_id", None),
-        os.getenv("ADMIN_USER_ID"),
-        os.getenv("ADMIN_ID"),
-    ]
-    uid_str = str(user_id).strip()
-    for val in admin_candidates:
-        if val is not None and str(val).strip() == uid_str:
-            return True
-    return False
+    """Чи є користувач власником бота (ADMIN_USER_ID у .env)."""
+    return user_id == settings.admin_user_id
 
 
 def parse_and_validate_time(time_str: str) -> Optional[str]:
