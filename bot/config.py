@@ -7,6 +7,11 @@ class Settings(BaseSettings):
     timezone: str = "Europe/Warsaw"
     admin_user_id: int
 
+    # Google Sheets (необов'язково: без цих значень синхронізація просто вимкнена)
+    google_credentials_path: str = ""
+    google_sheet_id: str = ""
+    google_sheet_tab: str = "v_tableau_daily_journal"
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 

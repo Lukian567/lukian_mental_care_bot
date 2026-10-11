@@ -3,3 +3,4 @@ pydantic-settings>=2.5.0
 sqlalchemy>=2.0.35
 asyncpg>=0.29.0
 apscheduler>=3.10.4
+gspread>=6.0.0
