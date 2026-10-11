@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from aiogram import Bot, Dispatcher
+from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -119,7 +119,7 @@ async def check_and_send_scheduled_reminders(bot: Bot):
             )
 
 
-def setup_scheduler(bot: Bot, dp: Dispatcher = None) -> AsyncIOScheduler:
+def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     """Ініціалізує та конфігурує задачі планувальника."""
     scheduler = AsyncIOScheduler()
 

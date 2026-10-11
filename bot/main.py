@@ -66,7 +66,7 @@ async def main() -> None:
     await set_bot_commands(bot)
 
     # Запуск фонового планувальника нагадувань
-    scheduler = setup_scheduler(bot, dp)
+    scheduler = setup_scheduler(bot)
     scheduler.start()
 
     logging.info("Бот готовий до роботи. Запускаємо polling...")
