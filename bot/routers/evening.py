@@ -1,252 +1,496 @@
-import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from aiogram import Router, F
-from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
-from aiogram.fsm.context import FSMContext
+from datetime import date
+from typing import Optional
 
-from bot.config import settings
-from bot.content import stubs
+from aiogram import F, Router
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, Message
+
 from bot.db.base import async_session
-from bot.db.repository import save_checkin
+from bot.db.repository import (
+    get_today_morning_anchor,
+    save_evening_checkin,
+)
 from bot.keyboards.checkin_kb import (
-    scale_kb,
-    evening_fact_kb,
-    action_done_kb,
-    contact_quality_kb,
-    emotion_kb,
-    compassion_kb,
+    action_result_kb,
+    activity_domains_kb,
+    dominant_emotion_kb,
+    emotion_intensity_kb,
+    evening_mood_kb,
+    social_state_kb,
+    evening_gratitude_kb,
 )
 from bot.states.checkin_states import EveningCheckin
 
 router = Router()
-logger = logging.getLogger(__name__)
+
+DOMAIN_LABEL_MAP = {
+    "cognitive": "🧠 Когнітивна праця (навчання / робота)",
+    "physical": "🏃 Фізична активність (тренування / рух)",
+    "social": "👥 Соціальна взаємодія (зустрічі / спілкування)",
+    "screen": "📱 Екранний час (скролінг / контент)",
+    "rest": "🔋 Відновлення (тиша / сон / відпочинок)",
+    "routine": "🧹 Побут (рутина / порядок)",
+    "stress": "⚡ Гострі стресори (форс-мажор / тиск)",
+}
+
+ACTION_RESULT_LABEL_MAP = {
+    "DONE": "✅ Так, повністю",
+    "PARTIAL": "⏳ Частково",
+    "MISSED": "❌ Не зробив(-ла)",
+    "OBSTACLES": "🔄 Завадили обставини",
+    "NO_PLAN_SET": "⚪ День був без плану",
+}
+
+SOCIAL_MAP = {
+    "charge": "🔋 Додало сил / підняло настрій",
+    "routine": "⚖️ Був серед людей — звичайна рутина",
+    "drain": "🪫 Забрало сили / виснажило",
+    "alienation": "👤 Був серед людей, але ніби сам",
+    "solitude": "🧘 Побув наодинці — відновив сили",
+    "alone_routine": "🏠 Побув(-ла) наодинці — звична нормальна рутина",
+    "isolation_drained": "🚪 Був сам — це пригнітило / брак людей",
+}
+
+EMOTION_MAP = {
+    "drive_joy": "🔥 Драйв / Радість",
+    "calm_balance": "😌 Спокій / Баланс",
+    "anxiety_tension": "⚡ Тривога / Напруга",
+    "anger_irritation": "😡 Злість / Дратівливість",
+    "sadness_down": "🌧 Сум / Пригніченість",
+    "apathy_empty": "🪫 Апатія / Порожнеча",
+    "guilt_shame": "😔 Провина / Сором",
+}
+
+GRATITUDE_MAP = {
+    "coped": "🛋 Впорався(-лась) із цим днем",
+    "discipline": "🎯 Дисципліна та конкретні кроки",
+    "rest": "🔋 Час на перепочинок",
+    "social": "🫂 Люди поруч / добрий вчинок",
+}
 
 
-# 1. Старт чекіну (/evening) -> Факт дня
+# -------------------------------------------------------------
+# Крок 1. Домени активності та навантаження (Мультиселект)
+# -------------------------------------------------------------
 @router.message(Command("evening"))
 async def cmd_evening(message: Message, state: FSMContext):
     await state.clear()
-    await state.set_state(EveningCheckin.day_fact)
+    await state.set_state(EveningCheckin.activity_domains)
+    await state.update_data(selected_domains=[], custom_activity_text=None)
+
     await message.answer(
-        stubs.Q_EVENING_DAY_FACT,
-        reply_markup=evening_fact_kb(),
+        "🌙 **Вечірній протокол (1/7)**\n\n"
+        "Куди сьогодні пішов час та енергія?\n\n"
+        "(Обери категорії, які займали відчутну частину дня)",
+        reply_markup=activity_domains_kb(selected_keys=[]),
+        parse_mode="Markdown",
     )
 
 
-# 2. Факт дня (кнопка) -> Настрій
-@router.callback_query(EveningCheckin.day_fact, F.data.startswith("fact:"))
-async def process_fact_btn(callback: CallbackQuery, state: FSMContext):
-    action = callback.data.split(":")[1]
+@router.callback_query(EveningCheckin.activity_domains, F.data.startswith("dom_tog:"))
+async def process_domain_toggle(callback: CallbackQuery, state: FSMContext):
+    key = callback.data.split(":")[1]
+    data = await state.get_data()
+    selected: list = data.get("selected_domains", [])
 
-    if action == "custom":
-        await callback.message.edit_text("Опиши коротко, що сьогодні реально відбулося:")
-        await callback.answer()
-        return
+    if key in selected:
+        selected.remove(key)
+    else:
+        selected.append(key)
 
-    fact_map = {
-        "bed": stubs.FACT_BED,
-        "base": stubs.FACT_BASE,
-        "out": stubs.FACT_OUT,
-        "prod": stubs.FACT_PRODUCTIVE,
-        "nothing": stubs.FACT_NOTHING,
-    }
-    await state.update_data(day_fact=fact_map.get(action, action))
-    await state.set_state(EveningCheckin.mood_score)
-    await callback.message.edit_text(
-        stubs.Q_EVENING_MOOD,
-        reply_markup=scale_kb("e_mood"),
+    await state.update_data(selected_domains=selected)
+    has_custom = bool(data.get("custom_activity_text"))
+
+    await callback.message.edit_reply_markup(
+        reply_markup=activity_domains_kb(selected_keys=selected, has_custom=has_custom)
     )
     await callback.answer()
 
 
-# 2а. Факт дня (введено вручну текстом) -> Настрій
-@router.message(EveningCheckin.day_fact)
-async def process_fact_text(message: Message, state: FSMContext):
-    await state.update_data(day_fact=message.text)
-    await state.set_state(EveningCheckin.mood_score)
+@router.callback_query(EveningCheckin.activity_domains, F.data == "dom_custom")
+async def process_domain_custom_ask(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(EveningCheckin.activity_domains_custom)
+    await callback.message.answer("✍️ Вкажи свій варіант текстом:")
+    await callback.answer()
+
+
+@router.message(EveningCheckin.activity_domains_custom, ~F.text.startswith("/"))
+async def process_domain_custom_receive(message: Message, state: FSMContext):
+    custom_text = message.text.strip()
+    data = await state.get_data()
+    selected = data.get("selected_domains", [])
+    await state.update_data(custom_activity_text=custom_text)
+    await state.set_state(EveningCheckin.activity_domains)
+
     await message.answer(
-        stubs.Q_EVENING_MOOD,
-        reply_markup=scale_kb("e_mood"),
+        f"✅ Додано: «{custom_text}»\n\n"
+        "Можеш обрати ще пункти або натиснути **➡️ Зберегти вибір**:",
+        reply_markup=activity_domains_kb(selected_keys=selected, has_custom=True),
+        parse_mode="Markdown",
     )
 
 
-# 3. Настрій -> Статус виконання мікро-дії
-@router.callback_query(EveningCheckin.mood_score, F.data.startswith("e_mood:"))
+@router.callback_query(EveningCheckin.activity_domains, F.data == "dom_save")
+async def process_domain_save(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected = data.get("selected_domains", [])
+    custom = data.get("custom_activity_text")
+
+    if not selected and not custom:
+        await callback.answer("⚠️ Обери хоча б один пункт або вкажи свій!", show_alert=True)
+        return
+
+    await state.set_state(EveningCheckin.evening_mood)
+    await callback.message.edit_text(
+        "🌙 **Вечірній протокол (2/7)**\n\n"
+        "Який загальний настрій дня?\n\n"
+        "(1 — негативний / важкий 📉\n 5 — позитивний / піднесений 🚀)",
+        reply_markup=evening_mood_kb(),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+# -------------------------------------------------------------
+# Крок 2. Загальний настрій дня -> Крок 3 (Якір) або Крок 4 (Соціум)
+# -------------------------------------------------------------
+@router.callback_query(EveningCheckin.evening_mood, F.data.startswith("e_mood:"))
 async def process_evening_mood(callback: CallbackQuery, state: FSMContext):
-    score = int(callback.data.split(":")[1])
-    await state.update_data(mood_score=score)
-    await state.set_state(EveningCheckin.action_done)
+    mood = int(callback.data.split(":")[1])
+    await state.update_data(evening_mood=mood)
+
+    today = date.today()
+    morning_anchor = None
+    try:
+        async with async_session() as session:
+            morning_anchor = await get_today_morning_anchor(session, callback.from_user.id, today)
+    except Exception:
+        morning_anchor = None
+
+    if not morning_anchor or "без плану" in morning_anchor.lower() or "no_plan" in morning_anchor.lower():
+        await state.update_data(action_result="NO_PLAN_SET", morning_anchor="⚪ День без плану")
+        await state.set_state(EveningCheckin.social_state)
+        await callback.message.edit_text(
+            "🌙 **Вечірній протокол (4/7)** *(ранковий якір був без плану — крок 3 пропущено)*\n\n"
+            "Як сьогодні контакт із людьми вплинув на твої сили?",
+            reply_markup=social_state_kb(),
+            parse_mode="Markdown",
+        )
+    else:
+        await state.update_data(morning_anchor=morning_anchor)
+        await state.set_state(EveningCheckin.action_result)
+        await callback.message.edit_text(
+            "🌙 **Вечірній протокол (3/7)**\n\n"
+            "Чи вдалося реалізувати заплановану дію?\n\n"
+            f"🎯 Твій якір: **«{morning_anchor}»**",
+            reply_markup=action_result_kb(),
+            parse_mode="Markdown",
+        )
+    await callback.answer()
+
+
+# -------------------------------------------------------------
+# Крок 3. Верифікація ранкового наміру -> Крок 4: Соціальний баланс
+# -------------------------------------------------------------
+@router.callback_query(EveningCheckin.action_result, F.data.startswith("act_res:"))
+async def process_action_result(callback: CallbackQuery, state: FSMContext):
+    res = callback.data.split(":")[1]
+    await state.update_data(action_result=res)
+    await state.set_state(EveningCheckin.social_state)
+
     await callback.message.edit_text(
-        stubs.Q_EVENING_ACTION_DONE,
-        reply_markup=action_done_kb(),
+        "🌙 **Вечірній протокол (4/7)**\n\n"
+        "Як сьогодні контакт із людьми вплинув на твої сили?",
+        reply_markup=social_state_kb(),
+        parse_mode="Markdown",
     )
     await callback.answer()
 
 
-# 4. Статус дії -> Контакт з людьми
-@router.callback_query(EveningCheckin.action_done, F.data.startswith("done:"))
-async def process_action_done(callback: CallbackQuery, state: FSMContext):
-    action = callback.data.split(":")[1]
-    done_map = {
-        "yes": stubs.STATUS_DONE,
-        "part": stubs.STATUS_PARTIAL,
-        "no": stubs.STATUS_FAIL,
-        "none": stubs.STATUS_NO_PLAN,
-    }
-    await state.update_data(action_done=done_map.get(action, action))
-    await state.set_state(EveningCheckin.contact_quality)
-    await callback.message.edit_text(
-        stubs.Q_EVENING_CONTACT_QUALITY,
-        reply_markup=contact_quality_kb(),
-    )
-    await callback.answer()
+# -------------------------------------------------------------
+# Крок 4. Соціальний енергетичний баланс -> Крок 5: Домінуюча емоція
+# -------------------------------------------------------------
+@router.callback_query(EveningCheckin.social_state, F.data.startswith("soc:"))
+async def process_social_state(callback: CallbackQuery, state: FSMContext):
+    val = callback.data.split(":")[1]
 
-
-# 5. Контакт (кнопка) -> Переважна емоція
-@router.callback_query(EveningCheckin.contact_quality, F.data.startswith("contact:"))
-async def process_contact_btn(callback: CallbackQuery, state: FSMContext):
-    action = callback.data.split(":")[1]
-
-    if action == "custom":
-        await callback.message.edit_text("Опиши свій контакт із людьми сьогодні повідомленням:")
+    if val == "custom":
+        await state.set_state(EveningCheckin.social_custom)
+        await callback.message.edit_text("✍️️ Опиши вплив людей текстом:", parse_mode="Markdown")
         await callback.answer()
         return
 
-    contact_map = {
-        "good": stubs.CONTACT_GOOD,
-        "work": stubs.CONTACT_WORK,
-        "alone": stubs.CONTACT_ALONE_IN_CROWD,
-        "avoid": stubs.CONTACT_AVOIDED,
-        "skip": "Пропущено",
-    }
-    await state.update_data(contact_quality=contact_map.get(action, action))
-    await state.set_state(EveningCheckin.emotion)
+    soc_label = None if val == "skip" else SOCIAL_MAP.get(val, val)
+    await state.update_data(social_state=soc_label, social_custom_text=None)
+    await state.set_state(EveningCheckin.dominant_emotion)
+
     await callback.message.edit_text(
-        stubs.Q_EVENING_EMOTION,
-        reply_markup=emotion_kb(),
+        "🌙 **Вечірній протокол (5/7)**\n\n"
+        "Яка емоція переважала сьогодні?\n\n"
+        "(Обери головний емоційний тон дня)",
+        reply_markup=dominant_emotion_kb(),
+        parse_mode="Markdown",
     )
     await callback.answer()
 
 
-# 5а. Контакт (текстом) -> Переважна емоція
-@router.message(EveningCheckin.contact_quality)
-async def process_contact_text(message: Message, state: FSMContext):
-    await state.update_data(contact_quality=message.text)
-    await state.set_state(EveningCheckin.emotion)
+@router.message(EveningCheckin.social_custom, ~F.text.startswith("/"))
+async def process_social_custom(message: Message, state: FSMContext):
+    text = message.text.strip()
+    await state.update_data(social_state="Власний опис", social_custom_text=text)
+    await state.set_state(EveningCheckin.dominant_emotion)
+
     await message.answer(
-        stubs.Q_EVENING_EMOTION,
-        reply_markup=emotion_kb(),
+        "🌙 **Вечірній протокол (5/7)**\n\n"
+        "Яка емоція переважала сьогодні?\n\n"
+        "(Обери головний емоційний тон дня)",
+        reply_markup=dominant_emotion_kb(),
+        parse_mode="Markdown",
     )
 
 
-# 6. Емоція -> Її інтенсивність (або одразу до підтримки, якщо пропуск)
-@router.callback_query(EveningCheckin.emotion, F.data.startswith("emo:"))
-async def process_emotion(callback: CallbackQuery, state: FSMContext):
-    action = callback.data.split(":")[1]
+# -------------------------------------------------------------
+# Крок 5. Домінуюча емоція дня -> Крок 6 або Крок 7
+# -------------------------------------------------------------
+@router.callback_query(EveningCheckin.dominant_emotion, F.data.startswith("emo:"))
+async def process_dominant_emotion(callback: CallbackQuery, state: FSMContext):
+    val = callback.data.split(":")[1]
 
-    if action == "skip":
-        await state.update_data(emotion="Пропущено", emotion_intensity=None)
-        await state.set_state(EveningCheckin.compassion)
+    if val == "custom":
+        await state.set_state(EveningCheckin.dominant_emotion_custom)
+        await callback.message.edit_text("✍️ Напиши головну емоцію сьогодні:", parse_mode="Markdown")
+        await callback.answer()
+        return
+
+    if val == "skip":
+        await state.update_data(dominant_emotion=None, emotion_custom_text=None, emotion_intensity=None)
+        await state.set_state(EveningCheckin.cognitive_closure)
         await callback.message.edit_text(
-            stubs.Q_EVENING_COMPASSION,
-            reply_markup=compassion_kb(),
+            "🌙 **Вечірній протокол (7/7)**\n\n"
+            "За що ти сьогодні можеш собі щиро подякувати або за що відчуваєш вдячність?",
+            reply_markup=evening_gratitude_kb(),
+            parse_mode="Markdown",
         )
         await callback.answer()
         return
 
-    emo_map = {
-        "sadness": stubs.EMO_SADNESS,
-        "anxiety": stubs.EMO_ANXIETY,
-        "anger": stubs.EMO_ANGER,
-        "guilt": stubs.EMO_GUILT,
-        "emptiness": stubs.EMO_EMPTINESS,
-        "calm": stubs.EMO_CALM,
-    }
-    await state.update_data(emotion=emo_map.get(action, action))
+    emo_label = EMOTION_MAP.get(val, val)
+    await state.update_data(dominant_emotion=emo_label, emotion_custom_text=None)
     await state.set_state(EveningCheckin.emotion_intensity)
+
     await callback.message.edit_text(
-        stubs.Q_EVENING_EMOTION_INTENSITY,
-        reply_markup=scale_kb("e_intensity"),
+        f"✅ Емоція: **{emo_label}**\n\n"
+        "🌙 **Вечірній протокол (6/7)**\n"
+        "Яка інтенсивність цієї емоції?\n\n"
+        "(1 — фонова / ледь помітна 🔹 ... 5 — пікова / переповнює 💥)",
+        reply_markup=emotion_intensity_kb(),
+        parse_mode="Markdown",
     )
     await callback.answer()
 
 
-# 7. Інтенсивність емоції -> Самопідтримка
-@router.callback_query(EveningCheckin.emotion_intensity, F.data.startswith("e_intensity:"))
+@router.message(EveningCheckin.dominant_emotion_custom, ~F.text.startswith("/"))
+async def process_emotion_custom(message: Message, state: FSMContext):
+    text = message.text.strip()
+    await state.update_data(dominant_emotion="Власна емоція", emotion_custom_text=text)
+    await state.set_state(EveningCheckin.emotion_intensity)
+
+    await message.answer(
+        f"✅ Емоція: **{text}**\n\n"
+        "🌙 **Вечірній протокол (6/7)**\n"
+        "Яка інтенсивність цієї емоції?\n\n"
+        "(1 — фонова / ледь помітна 🔹 ... 5 — пікова / переповнює 💥)",
+        reply_markup=emotion_intensity_kb(),
+        parse_mode="Markdown",
+    )
+
+
+# -------------------------------------------------------------
+# Крок 6. Інтенсивність емоції -> Крок 7: Вдячність / Самоспівчуття
+# -------------------------------------------------------------
+@router.callback_query(EveningCheckin.emotion_intensity, F.data.startswith("emo_int:"))
 async def process_emotion_intensity(callback: CallbackQuery, state: FSMContext):
-    score = int(callback.data.split(":")[1])
-    await state.update_data(emotion_intensity=score)
-    await state.set_state(EveningCheckin.compassion)
+    intensity = int(callback.data.split(":")[1])
+    await state.update_data(emotion_intensity=intensity)
+    await state.set_state(EveningCheckin.cognitive_closure)
+
     await callback.message.edit_text(
-        stubs.Q_EVENING_COMPASSION,
-        reply_markup=compassion_kb(),
+        "🌙 **Вечірній протокол (7/7)**\n\n"
+        "За що ти сьогодні можеш собі щиро подякувати або за що відчуваєш вдячність?",
+        reply_markup=evening_gratitude_kb(),
+        parse_mode="Markdown",
     )
     await callback.answer()
 
 
-# 8. Фінал: Самопідтримка (кнопка) -> Збереження та ВИДАЛЕННЯ кнопок
-@router.callback_query(EveningCheckin.compassion, F.data.startswith("comp:"))
-async def process_compassion_btn(callback: CallbackQuery, state: FSMContext):
-    action = callback.data.split(":")[1]
+# -------------------------------------------------------------
+# Крок 7. Вдячність і збереження фіналу
+# -------------------------------------------------------------
+@router.callback_query(EveningCheckin.cognitive_closure, F.data.startswith("closure:"))
+async def process_gratitude_select(callback: CallbackQuery, state: FSMContext):
+    val = callback.data.split(":")[1]
 
-    if action == "custom":
-        await callback.message.edit_text("Що б ти сказав(-ла) другові? Напиши повідомленням:")
+    if val == "custom":
+        await state.set_state(EveningCheckin.cognitive_closure_custom)
+        await callback.message.edit_text("✍️ За що сьогодні хочеш подякувати собі або світу?", parse_mode="Markdown")
         await callback.answer()
         return
 
-    comp_map = {
-        "best": stubs.COMPASSION_BEST,
-        "normal": stubs.COMPASSION_NORMAL,
-        "enough": stubs.COMPASSION_ENOUGH,
-        "tomorrow": stubs.COMPASSION_TOMORROW,
-        "skip": "Пропущено",
-    }
-    await state.update_data(compassion=comp_map.get(action, action))
+    label = None if val == "skip" else GRATITUDE_MAP.get(val, val)
+    await complete_evening_checkin(callback, state, closure_label=label, closure_custom=None)
+
+
+@router.message(EveningCheckin.cognitive_closure_custom, ~F.text.startswith("/"))
+async def process_gratitude_custom(message: Message, state: FSMContext):
+    text = message.text.strip()
+    await complete_evening_checkin(message, state, closure_label="Своя подяка", closure_custom=text)
+
+
+async def complete_evening_checkin(
+    target,
+    state: FSMContext,
+    closure_label: Optional[str] = None,
+    closure_custom: Optional[str] = None,
+):
+    data = await state.get_data()
+    user_id = target.from_user.id
+    today = date.today()
+
+    domains = data.get("selected_domains", [])
+    domain_names = [DOMAIN_LABEL_MAP.get(k, k) for k in domains]
+    if data.get("custom_activity_text"):
+        domain_names.append(data.get("custom_activity_text"))
+
+    try:
+        async with async_session() as session:
+            await save_evening_checkin(
+                session=session,
+                telegram_user_id=user_id,
+                checkin_date=today,
+                activity_domains=domains,
+                custom_activity_text=data.get("custom_activity_text"),
+                evening_mood=data.get("evening_mood", 3),
+                action_result=data.get("action_result"),
+                social_state=data.get("social_state"),
+                social_custom_text=data.get("social_custom_text"),
+                dominant_emotion=data.get("dominant_emotion"),
+                emotion_custom_text=data.get("emotion_custom_text"),
+                emotion_intensity=data.get("emotion_intensity"),
+                cognitive_closure=closure_label,
+                closure_custom_text=closure_custom,
+                raw_payload=data,
+            )
+    except Exception as e:
+        print("Save evening checkin error:", e)
+
+    await state.clear()
+
+    domains_str = ", ".join(domain_names) if domain_names else "—"
+    raw_action_res = data.get("action_result")
+    action_res_str = ACTION_RESULT_LABEL_MAP.get(raw_action_res, raw_action_res or "—")
+    emo_disp = data.get("emotion_custom_text") or data.get("dominant_emotion") or "—"
+    intensity_disp = f" ({data.get('emotion_intensity')}/5)" if data.get("emotion_intensity") else ""
+    gratitude_disp = closure_custom or closure_label or "—"
+
+    summary_text = (
+        "🌙 **Вечірній протокол збережено!**\n\n"
+        f"• Настрій дня: **{data.get('evening_mood')}/5**\n"
+        f"• Сфери активності: **{domains_str}**\n"
+        f"• Результат дії: **{action_res_str}**\n"
+        f"• Соціальний баланс: **{data.get('social_custom_text') or data.get('social_state') or '—'}**\n"
+        f"• Емоція: **{emo_disp}{intensity_disp}**\n"
+        f"• Вдячність / Підтримка: **{gratitude_disp}**\n\n"
+        "День зафіксовано. Дякую за рефлексію! Відпочивай та відновлюйся. 😴"
+    )
+
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(summary_text, parse_mode="Markdown")
+        await target.answer()
+    else:
+        await target.answer(summary_text, parse_mode="Markdown")
+
+
+# -------------------------------------------------------------
+# Обробник універсального повернення «« Назад» на 1 крок
+# -------------------------------------------------------------
+@router.callback_query(F.data.startswith("e_back:"))
+async def process_evening_back(callback: CallbackQuery, state: FSMContext):
+    target_step = callback.data.split(":")[1]
+    data = await state.get_data()
+
+    if target_step == "1":
+        await state.set_state(EveningCheckin.activity_domains)
+        selected = data.get("selected_domains", [])
+        has_custom = bool(data.get("custom_activity_text"))
+        await callback.message.edit_text(
+            "🌙 **Вечірній протокол (1/7)**\n\n"
+            "Куди сьогодні пішов час та енергія?\n\n"
+            "(Обери категорії, які займали відчутну частину дня)",
+            reply_markup=activity_domains_kb(selected_keys=selected, has_custom=has_custom),
+            parse_mode="Markdown",
+        )
+
+    elif target_step == "2":
+        await state.set_state(EveningCheckin.evening_mood)
+        await callback.message.edit_text(
+            "🌙 **Вечірній протокол (2/7)**\n\n"
+            "Який загальний настрій дня?\n\n"
+            "(1 — негативний / важкий 📉\n 5 — позитивний / піднесений 🚀)",
+            reply_markup=evening_mood_kb(),
+            parse_mode="Markdown",
+        )
+
+    elif target_step == "3":
+        anchor = data.get("morning_anchor")
+        if not anchor or "без плану" in anchor.lower() or "no_plan" in anchor.lower() or data.get("action_result") == "NO_PLAN_SET":
+            await state.set_state(EveningCheckin.evening_mood)
+            await callback.message.edit_text(
+                "🌙 **Вечірній протокол (2/7)**\n\n"
+                "Який загальний настрій дня?\n\n"
+                "(1 — негативний / важкий 📉\n 5 — позитивний / піднесений 🚀)",
+                reply_markup=evening_mood_kb(),
+                parse_mode="Markdown",
+            )
+        else:
+            await state.set_state(EveningCheckin.action_result)
+            await callback.message.edit_text(
+                "🌙 **Вечірній протокол (3/7)**\n\n"
+                "Чи вдалося реалізувати заплановану дію?\n\n"
+                f"🎯 Твій якір: **«{anchor}»**",
+                reply_markup=action_result_kb(),
+                parse_mode="Markdown",
+            )
+
+    elif target_step == "4":
+        await state.set_state(EveningCheckin.social_state)
+        await callback.message.edit_text(
+            "🌙 **Вечірній протокол (4/7)**\n\n"
+            "Як сьогодні контакт із людьми вплинув на твої сили?",
+            reply_markup=social_state_kb(),
+            parse_mode="Markdown",
+        )
+
+    elif target_step == "5":
+        await state.set_state(EveningCheckin.dominant_emotion)
+        await callback.message.edit_text(
+            "🌙 **Вечірній протокол (5/7)**\n\n"
+            "Яка емоція переважала сьогодні?\n\n"
+            "(Обери головний емоційний тон дня)",
+            reply_markup=dominant_emotion_kb(),
+            parse_mode="Markdown",
+        )
+
+    elif target_step == "6":
+        await state.set_state(EveningCheckin.emotion_intensity)
+        disp_emo = data.get("emotion_custom_text") or data.get("dominant_emotion") or "Обрана емоція"
+        await callback.message.edit_text(
+            f"✅ Емоція: **{disp_emo}**\n\n"
+            "🌙 **Вечірній протокол (6/7)**\n"
+            "Яка інтенсивність цієї емоції?\n\n"
+            "(1 — фонова / ледь помітна 🔹 ... 5 — пікова / переповнює 💥)",
+            reply_markup=emotion_intensity_kb(),
+            parse_mode="Markdown",
+        )
+
     await callback.answer()
-
-    # Зберігаємо в базу і ПЕРЕПИСУЄМО повідомлення, щоб кнопки зникли!
-    try:
-        data = await state.get_data()
-        today = datetime.now(ZoneInfo(settings.timezone)).date()
-
-        async with async_session() as session:
-            await save_checkin(
-                session=session,
-                user_id=callback.from_user.id,
-                checkin_date=today,
-                period="evening",
-                data=data,
-            )
-
-        await state.clear()
-        # Ось тут замість answer використовуємо edit_text
-        await callback.message.edit_text(stubs.EVENING_COMPLETE_MSG)
-    except Exception as e:
-        logger.exception("Помилка збереження вечірнього чекіну: %s", e)
-        await callback.message.answer(f"Помилка при збереженні: {e}")
-
-
-# 8а. Фінал: Самопідтримка (якщо введено вручну текстом)
-@router.message(EveningCheckin.compassion)
-async def process_compassion_text(message: Message, state: FSMContext):
-    await state.update_data(compassion=message.text)
-    try:
-        data = await state.get_data()
-        today = datetime.now(ZoneInfo(settings.timezone)).date()
-
-        async with async_session() as session:
-            await save_checkin(
-                session=session,
-                user_id=message.from_user.id,
-                checkin_date=today,
-                period="evening",
-                data=data,
-            )
-
-        await state.clear()
-        await message.answer(stubs.EVENING_COMPLETE_MSG)
-    except Exception as e:
-        logger.exception("Помилка збереження вечірнього чекіну: %s", e)
-        await message.answer(f"Помилка при збереженні: {e}")

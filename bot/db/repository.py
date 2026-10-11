@@ -1,351 +1,555 @@
 import csv
 import io
+from collections import Counter
 from datetime import date, timedelta
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import select, func, desc, delete
+from sqlalchemy import delete, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.db.models import DailyCheckin, CheckinPeriod, User
+from bot.db.models import CheckinPeriod, DailyCheckin, User
 
 
-async def save_checkin(
-    session: AsyncSession,
-    user_id: int,
-    checkin_date: date,
-    period: str,
-    data: dict,
-) -> DailyCheckin:
-    """Зберігає сесію чекіну з FSM у таблицю daily_checkins."""
-    try:
-        period_enum = CheckinPeriod(period)
-    except (ValueError, TypeError):
-        period_enum = getattr(CheckinPeriod, period, period)
-
-    checkin = DailyCheckin(
-        telegram_user_id=user_id,
-        checkin_date=checkin_date,
-        period=period_enum,
-        # 🌅 РАНОК
-        sleep_duration_minutes=data.get("sleep_duration_minutes"),
-        sleep_quality=data.get("sleep_quality"),
-        morning_mood=data.get("morning_mood"),
-        resistance_level=data.get("resistance_level"),
-        anxiety_level=data.get("anxiety_level"),
-        morning_thought=str(data.get("morning_thought", ""))[:500] if data.get("morning_thought") else None,
-        micro_action=str(data.get("micro_action", ""))[:500] if data.get("micro_action") else None,
-        # 🌙 ВЕЧІР
-        day_fact=str(data.get("day_fact", ""))[:500] if data.get("day_fact") else None,
-        mood_score=data.get("mood_score"),
-        action_done=str(data.get("action_done", ""))[:200] if data.get("action_done") else None,
-        contact_quality=str(data.get("contact_quality", ""))[:200] if data.get("contact_quality") else None,
-        emotion=str(data.get("emotion", ""))[:100] if data.get("emotion") else None,
-        emotion_intensity=data.get("emotion_intensity"),
-        compassion=str(data.get("compassion", ""))[:500] if data.get("compassion") else None,
-        # Повний JSON контекст
-        raw_payload=data,
-    )
-
-    session.add(checkin)
-    await session.commit()
-    await session.refresh(checkin)
-    return checkin
-
+# ==========================================
+# 👤 КОРИСТУВАЧІ ТА РОЗКЛАД
+# ==========================================
 
 async def register_or_update_user(
     session: AsyncSession,
     telegram_user_id: int,
-    first_name: Optional[str],
-    username: Optional[str],
-    timezone: str = "Europe/Warsaw",
+    first_name: Optional[str] = None,
+    username: Optional[str] = None,
 ) -> User:
-    """Реєструє або оновлює користувача."""
     stmt = select(User).where(User.telegram_user_id == telegram_user_id)
-    result = await session.execute(stmt)
-    user = result.scalar_one_or_none()
+    res = await session.execute(stmt)
+    user = res.scalars().first()
 
-    if user is None:
+    if user:
+        user.first_name = first_name
+        user.username = username
+        user.is_active = True
+    else:
         user = User(
             telegram_user_id=telegram_user_id,
             first_name=first_name,
             username=username,
-            timezone=timezone,
+            timezone="Europe/Warsaw",
+            morning_reminder_time="08:00",
+            evening_reminder_time="22:00",
+            is_onboarded=False,
             is_active=True,
         )
         session.add(user)
-    else:
-        user.first_name = first_name
-        user.username = username
-        user.is_active = True
 
     await session.commit()
     await session.refresh(user)
     return user
 
 
-async def update_user_timezone(
-    session: AsyncSession,
-    telegram_user_id: int,
-    timezone: str,
-) -> bool:
-    """Змінює часовий пояс користувача (Europe/Warsaw або Europe/Kyiv)."""
+async def get_user(session: AsyncSession, telegram_user_id: int) -> Optional[User]:
     stmt = select(User).where(User.telegram_user_id == telegram_user_id)
-    result = await session.execute(stmt)
-    user = result.scalar_one_or_none()
-    if user:
-        user.timezone = timezone
-        await session.commit()
-        return True
-    return False
+    res = await session.execute(stmt)
+    return res.scalars().first()
 
 
-async def get_user_timezone(
-    session: AsyncSession,
-    telegram_user_id: int,
-) -> str:
-    """Повертає таймзону користувача або Europe/Warsaw за замовчуванням."""
+async def get_user_timezone(session: AsyncSession, telegram_user_id: int) -> str:
     stmt = select(User.timezone).where(User.telegram_user_id == telegram_user_id)
-    result = await session.execute(stmt)
-    tz = result.scalar_one_or_none()
+    res = await session.execute(stmt)
+    tz = res.scalars().first()
     return tz or "Europe/Warsaw"
 
 
-async def get_active_users_by_timezone(
+async def update_user_timezone(session: AsyncSession, telegram_user_id: int, timezone: str) -> None:
+    stmt = select(User).where(User.telegram_user_id == telegram_user_id)
+    res = await session.execute(stmt)
+    user = res.scalars().first()
+    if user:
+        user.timezone = timezone
+        await session.commit()
+
+
+async def update_user_schedule(
+    session: AsyncSession,
+    telegram_user_id: int,
+    timezone: Optional[str] = None,
+    morning_time: Optional[str] = None,
+    evening_time: Optional[str] = None,
+    is_onboarded: Optional[bool] = None,
+) -> None:
+    stmt = select(User).where(User.telegram_user_id == telegram_user_id)
+    res = await session.execute(stmt)
+    user = res.scalars().first()
+    if user:
+        if timezone is not None:
+            user.timezone = timezone
+        if morning_time is not None:
+            user.morning_reminder_time = morning_time
+        if evening_time is not None:
+            user.evening_reminder_time = evening_time
+        if is_onboarded is not None:
+            user.is_onboarded = is_onboarded
+        await session.commit()
+
+
+async def get_active_users_by_timezone(session: AsyncSession, timezone: str) -> List[User]:
+    stmt = select(User).where(User.timezone == timezone, User.is_active == True)
+    res = await session.execute(stmt)
+    return list(res.scalars().all())
+
+
+async def get_users_for_reminder(
     session: AsyncSession,
     timezone: str,
+    target_time: str,
+    period: str,
 ) -> List[User]:
-    """Повертає список активних користувачів конкретного часового поясу."""
-    stmt = select(User).where(User.is_active == True, User.timezone == timezone)
-    result = await session.execute(stmt)
-    return list(result.scalars().all())
+    time_column = (
+        User.morning_reminder_time if period == "morning" else User.evening_reminder_time
+    )
+    stmt = select(User).where(
+        User.timezone == timezone,
+        User.is_active == True,
+        time_column == target_time,
+    )
+    res = await session.execute(stmt)
+    return list(res.scalars().all())
 
 
-async def get_user_streak(
+# ==========================================
+# 🌅 РАНКОВИЙ ЧЕКІН
+# ==========================================
+
+async def save_morning_checkin(
     session: AsyncSession,
-    user_id: int,
-    today: date,
-) -> tuple[int, int]:
-    """Рахує поточний та максимальний стрік чекінів."""
+    telegram_user_id: int,
+    checkin_date: date,
+    sleep_hours: float,
+    sleep_quality: int,
+    morning_mood: int,
+    morning_resistance: int,
+    morning_anxiety: int,
+    morning_thought: Optional[str] = None,
+    morning_thought_pattern: Optional[str] = None,
+    morning_thought_custom: Optional[str] = None,
+    morning_action_anchor: Optional[str] = None,
+    raw_payload: Optional[dict] = None,
+    **kwargs: Any,
+) -> DailyCheckin:
+    stmt = (
+        select(DailyCheckin)
+        .where(
+            DailyCheckin.telegram_user_id == telegram_user_id,
+            DailyCheckin.checkin_date == checkin_date,
+            DailyCheckin.period.in_([CheckinPeriod.morning, "morning"]),
+        )
+        .order_by(DailyCheckin.id.desc())
+    )
+    res = await session.execute(stmt)
+    checkin = res.scalars().first()
+
+    if not checkin:
+        checkin = DailyCheckin(
+            telegram_user_id=telegram_user_id,
+            checkin_date=checkin_date,
+            period=CheckinPeriod.morning,
+        )
+        session.add(checkin)
+
+    # Визначаємо текст думки без службової заглушки "Думка"
+    thought = morning_thought or morning_thought_custom or morning_thought_pattern
+    if thought == "Думка":
+        thought = morning_thought_custom or None
+
+    checkin.sleep_hours = sleep_hours
+    checkin.sleep_quality = sleep_quality
+    checkin.morning_mood = morning_mood
+    checkin.morning_resistance = morning_resistance
+    checkin.morning_anxiety = morning_anxiety
+    checkin.morning_thought = thought
+    checkin.morning_action_anchor = morning_action_anchor
+    checkin.raw_payload = raw_payload
+
+    await session.commit()
+    await session.refresh(checkin)
+    return checkin
+
+
+# ==========================================
+# 🌙 ВЕЧІРНІЙ ЧЕКІН
+# ==========================================
+
+async def save_evening_checkin(
+    session: AsyncSession,
+    telegram_user_id: int,
+    checkin_date: date,
+    activity_domains: List[str],
+    evening_mood: int = 0,
+    action_result: Optional[str] = None,
+    social_state: Optional[str] = None,
+    social_custom_text: Optional[str] = None,
+    dominant_emotion: Optional[str] = None,
+    emotion_custom_text: Optional[str] = None,
+    emotion_intensity: Optional[int] = None,
+    cognitive_closure: Optional[str] = None,
+    closure_custom_text: Optional[str] = None,
+    raw_payload: Optional[dict] = None,
+    **kwargs: Any,
+) -> DailyCheckin:
+    stmt = (
+        select(DailyCheckin)
+        .where(
+            DailyCheckin.telegram_user_id == telegram_user_id,
+            DailyCheckin.checkin_date == checkin_date,
+            DailyCheckin.period.in_([CheckinPeriod.evening, "evening"]),
+        )
+        .order_by(DailyCheckin.id.desc())
+    )
+    res = await session.execute(stmt)
+    checkin = res.scalars().first()
+
+    if not checkin:
+        checkin = DailyCheckin(
+            telegram_user_id=telegram_user_id,
+            checkin_date=checkin_date,
+            period=CheckinPeriod.evening,
+        )
+        session.add(checkin)
+
+    checkin.evening_mood = evening_mood
+    checkin.activity_domains = activity_domains
+    checkin.action_result = action_result
+    checkin.social_state = social_custom_text or social_state
+    checkin.dominant_emotion = emotion_custom_text or dominant_emotion
+    checkin.emotion_intensity = emotion_intensity
+    checkin.cognitive_closure = closure_custom_text or cognitive_closure
+    checkin.raw_payload = raw_payload
+
+    await session.commit()
+    await session.refresh(checkin)
+    return checkin
+
+
+# ==========================================
+# 🔍 ДОПОМІЖНІ ЗАПИТИ ТА СТАТИСТИКА
+# ==========================================
+
+async def get_today_morning_anchor(
+    session: AsyncSession,
+    telegram_user_id: int,
+    checkin_date: date,
+) -> Optional[str]:
+    stmt = (
+        select(DailyCheckin.morning_action_anchor)
+        .where(
+            DailyCheckin.telegram_user_id == telegram_user_id,
+            DailyCheckin.checkin_date == checkin_date,
+            DailyCheckin.period.in_([CheckinPeriod.morning, "morning"]),
+        )
+        .order_by(DailyCheckin.id.desc())
+    )
+    res = await session.execute(stmt)
+    return res.scalars().first()
+
+
+async def calculate_user_streak(session: AsyncSession, telegram_user_id: int) -> Tuple[int, int]:
     stmt = (
         select(DailyCheckin.checkin_date)
-        .where(DailyCheckin.telegram_user_id == user_id)
+        .where(DailyCheckin.telegram_user_id == telegram_user_id)
         .distinct()
-        .order_by(DailyCheckin.checkin_date.desc())
+        .order_by(desc(DailyCheckin.checkin_date))
     )
-    result = await session.execute(stmt)
-    dates = [row[0] for row in result.all()]
+    res = await session.execute(stmt)
+    raw_dates = [row[0] for row in res.all()]
 
-    if not dates:
+    if not raw_dates:
         return 0, 0
 
-    unique_dates = sorted(set(dates), reverse=True)
-    yesterday = today - timedelta(days=1)
-
-    # 1. Поточний стрік
-    current_streak = 0
-    if unique_dates[0] == today:
-        expected = today
-    elif unique_dates[0] == yesterday:
-        expected = yesterday
-    else:
-        expected = None
-
-    if expected is not None:
-        for d in unique_dates:
-            if d == expected:
-                current_streak += 1
-                expected -= timedelta(days=1)
-            elif d < expected:
-                break
-
-    # 2. Рекордний стрік
-    max_streak = 0
-    temp_streak = 1
-    for i in range(len(unique_dates) - 1):
-        if (unique_dates[i] - unique_dates[i + 1]).days == 1:
-            temp_streak += 1
+    dates = []
+    for d in raw_dates:
+        if hasattr(d, "date"):
+            dates.append(d.date())
         else:
-            if temp_streak > max_streak:
-                max_streak = temp_streak
-            temp_streak = 1
-    if temp_streak > max_streak:
-        max_streak = temp_streak
+            dates.append(d)
 
-    max_streak = max(max_streak, current_streak)
-    return current_streak, max_streak
+    today = date.today()
+    current_streak = 0
+    check_day = today
+
+    if dates[0] == today:
+        current_streak = 1
+        check_day = today - timedelta(days=1)
+    elif dates[0] == today - timedelta(days=1):
+        current_streak = 1
+        check_day = today - timedelta(days=2)
+    else:
+        current_streak = 0
+
+    if current_streak > 0:
+        date_set = set(dates)
+        while check_day in date_set:
+            current_streak += 1
+            check_day -= timedelta(days=1)
+
+    max_streak = 0
+    temp_streak = 0
+    sorted_unique = sorted(set(dates))
+    if sorted_unique:
+        temp_streak = 1
+        max_streak = 1
+        for i in range(1, len(sorted_unique)):
+            if sorted_unique[i] - sorted_unique[i - 1] == timedelta(days=1):
+                temp_streak += 1
+                max_streak = max(max_streak, temp_streak)
+            else:
+                temp_streak = 1
+
+    return current_streak, max(max_streak, current_streak)
+
+
+DOMAIN_PRETTY_MAP = {
+    "cognitive": "🧠 Робота/Навчання",
+    "physical": "🏃 Спорт/Рух",
+    "social": "👥 Соціум",
+    "screen": "📱 Екрани",
+    "rest": "🔋 Відпочинок",
+    "routine": "🧹 Побут",
+    "stress": "⚡ Стресори",
+}
 
 
 async def get_weekly_stats(
     session: AsyncSession,
-    user_id: int,
+    telegram_user_id: int,
     days: int = 7,
-    today: Optional[date] = None,
-) -> dict:
-    """Збирає статистику та стріки."""
-    if today is None:
-        today = date.today()
+) -> Dict[str, Any]:
+    start_date = date.today() - timedelta(days=days - 1)
 
-    start_date = today - timedelta(days=days - 1)
+    all_time_stmt = select(func.count(DailyCheckin.id)).where(DailyCheckin.telegram_user_id == telegram_user_id)
+    total_all_time = (await session.execute(all_time_stmt)).scalar() or 0
 
     stmt = (
         select(DailyCheckin)
         .where(
-            DailyCheckin.telegram_user_id == user_id,
+            DailyCheckin.telegram_user_id == telegram_user_id,
             DailyCheckin.checkin_date >= start_date,
-            DailyCheckin.checkin_date <= today,
         )
         .order_by(DailyCheckin.checkin_date.asc())
     )
-    result = await session.execute(stmt)
-    records = result.scalars().all()
+    res = await session.execute(stmt)
+    records = res.scalars().all()
 
-    morning_records = [r for r in records if r.period == CheckinPeriod.morning]
-    evening_records = [r for r in records if r.period == CheckinPeriod.evening]
+    morning_by_date = {}
+    evening_by_date = {}
 
-    sleep_minutes = [
-        r.sleep_duration_minutes
-        for r in morning_records
-        if r.sleep_duration_minutes is not None
+    for r in records:
+        period_str = r.period.value if hasattr(r.period, "value") else str(r.period)
+        if period_str == "morning":
+            morning_by_date[r.checkin_date] = r
+        elif period_str == "evening":
+            evening_by_date[r.checkin_date] = r
+
+    m_count = len(morning_by_date)
+    e_count = len(evening_by_date)
+
+    sleep_hours_list = [r.sleep_hours for r in morning_by_date.values() if r.sleep_hours is not None]
+    sleep_quality_list = [r.sleep_quality for r in morning_by_date.values() if r.sleep_quality is not None]
+    morning_mood_list = [r.morning_mood for r in morning_by_date.values() if r.morning_mood is not None]
+    resistance_list = [r.morning_resistance for r in morning_by_date.values() if r.morning_resistance is not None]
+    anxiety_list = [r.morning_anxiety for r in morning_by_date.values() if r.morning_anxiety is not None]
+
+    avg_sleep_hours = round(sum(sleep_hours_list) / len(sleep_hours_list), 1) if sleep_hours_list else None
+    avg_sleep_quality = round(sum(sleep_quality_list) / len(sleep_quality_list), 1) if sleep_quality_list else None
+    avg_morning_mood = round(sum(morning_mood_list) / len(morning_mood_list), 1) if morning_mood_list else None
+    avg_resistance = round(sum(resistance_list) / len(resistance_list), 1) if resistance_list else None
+    avg_anxiety = round(sum(anxiety_list) / len(anxiety_list), 1) if anxiety_list else None
+
+    evening_mood_list = [r.evening_mood for r in evening_by_date.values() if r.evening_mood is not None]
+    avg_evening_mood = round(sum(evening_mood_list) / len(evening_mood_list), 1) if evening_mood_list else None
+
+    mood_deltas = []
+    for d, m_rec in morning_by_date.items():
+        if d in evening_by_date:
+            e_rec = evening_by_date[d]
+            if e_rec.evening_mood is not None and m_rec.morning_mood is not None:
+                mood_deltas.append(e_rec.evening_mood - m_rec.morning_mood)
+    avg_mood_delta = round(sum(mood_deltas) / len(mood_deltas), 2) if mood_deltas else None
+
+    domain_counter = Counter()
+    for e_rec in evening_by_date.values():
+        if e_rec.activity_domains:
+            domain_counter.update(e_rec.activity_domains)
+    top_domains = [
+        f"{DOMAIN_PRETTY_MAP.get(k, k)} ({cnt})"
+        for k, cnt in domain_counter.most_common(3)
     ]
-    avg_sleep_hours = (
-        round(sum(sleep_minutes) / len(sleep_minutes) / 60, 1)
-        if sleep_minutes
-        else None
-    )
 
-    sleep_q = [r.sleep_quality for r in morning_records if r.sleep_quality is not None]
-    avg_sleep_quality = round(sum(sleep_q) / len(sleep_q), 1) if sleep_q else None
+    social_charged = 0
+    social_drained = 0
+    for e_rec in evening_by_date.values():
+        st = (e_rec.social_state or "").lower()
+        if any(w in st for w in ["charge", "solitude", "підняло", "відновив"]):
+            social_charged += 1
+        elif any(w in st for w in ["drain", "alienation", "isolation", "виснажило", "пригнітило", "сам"]):
+            social_drained += 1
 
-    resist = [
-        r.resistance_level for r in morning_records if r.resistance_level is not None
-    ]
-    avg_resistance = round(sum(resist) / len(resist), 1) if resist else None
+    emotion_counter = Counter()
+    for e_rec in evening_by_date.values():
+        emo = e_rec.dominant_emotion
+        if emo:
+            emotion_counter.update([emo])
+    top_emotion = emotion_counter.most_common(1)[0][0] if emotion_counter else None
 
-    anx = [r.anxiety_level for r in morning_records if r.anxiety_level is not None]
-    avg_anxiety = round(sum(anx) / len(anx), 1) if anx else None
-
-    m_moods = [
-        r.morning_mood
-        for r in morning_records
-        if r.morning_mood is not None
-    ]
-    avg_morning_mood = round(sum(m_moods) / len(m_moods), 1) if m_moods else None
-
-    e_moods = [r.mood_score for r in evening_records if r.mood_score is not None]
-    avg_evening_mood = round(sum(e_moods) / len(e_moods), 1) if e_moods else None
-
-    emotions = [
-        r.emotion
-        for r in evening_records
-        if r.emotion and r.emotion != "Пропущено"
-    ]
-    top_emotion = max(set(emotions), key=emotions.count) if emotions else None
-
-    current_streak, max_streak = await get_user_streak(session, user_id, today)
+    current_streak, max_streak = await calculate_user_streak(session, telegram_user_id)
 
     return {
         "days": days,
-        "morning_count": len(morning_records),
-        "evening_count": len(evening_records),
+        "total_all_time": total_all_time,
+        "current_streak": current_streak,
+        "max_streak": max_streak,
+        "morning_count": m_count,
+        "evening_count": e_count,
         "avg_sleep_hours": avg_sleep_hours,
         "avg_sleep_quality": avg_sleep_quality,
         "avg_morning_mood": avg_morning_mood,
         "avg_resistance": avg_resistance,
         "avg_anxiety": avg_anxiety,
         "avg_evening_mood": avg_evening_mood,
+        "avg_mood_delta": avg_mood_delta,
+        "top_domains": top_domains,
+        "social_charged": social_charged,
+        "social_drained": social_drained,
         "top_emotion": top_emotion,
-        "current_streak": current_streak,
-        "max_streak": max_streak,
     }
 
 
-async def delete_user_checkins(session: AsyncSession, user_id: int) -> int:
-    """Видаляє всі чекіни користувача з бази даних."""
-    stmt = delete(DailyCheckin).where(DailyCheckin.telegram_user_id == user_id)
+async def delete_user_checkins(session: AsyncSession, telegram_user_id: int) -> int:
+    stmt = delete(DailyCheckin).where(DailyCheckin.telegram_user_id == telegram_user_id)
     result = await session.execute(stmt)
     await session.commit()
     return result.rowcount
 
 
+# ==========================================
+# 📊 ЕКСПОРТ В CSV
+# ==========================================
+
 async def export_all_checkins_csv(session: AsyncSession) -> str:
-    """Генерує повний CSV-звіт з усіма записами чекінів."""
-    stmt = select(DailyCheckin).order_by(DailyCheckin.id.asc())
-    result = await session.execute(stmt)
-    records = result.scalars().all()
+    stmt = select(DailyCheckin).order_by(DailyCheckin.checkin_date.desc(), DailyCheckin.period)
+    res = await session.execute(stmt)
+    checkins = res.scalars().all()
 
     output = io.StringIO()
-    writer = csv.writer(output)
+    writer = csv.writer(output, dialect="excel")
 
     headers = [
-        "id",
-        "telegram_user_id",
-        "checkin_date",
-        "period",
-        "sleep_duration_minutes",
-        "sleep_quality",
-        "morning_mood",
-        "resistance_level",
-        "anxiety_level",
-        "morning_thought",
-        "micro_action",
-        "day_fact",
-        "mood_score",
-        "action_done",
-        "contact_quality",
-        "emotion",
-        "emotion_intensity",
-        "compassion",
-        "created_at",
+        "id", "telegram_user_id", "checkin_date", "period", "sleep_hours",
+        "sleep_quality", "morning_mood", "morning_resistance", "morning_anxiety",
+        "morning_thought", "morning_action_anchor", "evening_mood",
+        "activity_domains", "action_result", "social_state", "dominant_emotion",
+        "emotion_intensity", "cognitive_closure", "raw_payload", "created_at",
     ]
     writer.writerow(headers)
 
-    for r in records:
+    for c in checkins:
         writer.writerow([
-            r.id,
-            r.telegram_user_id,
-            r.checkin_date.isoformat() if r.checkin_date else None,
-            r.period.value if hasattr(r.period, "value") else str(r.period),
-            r.sleep_duration_minutes,
-            r.sleep_quality,
-            r.morning_mood,
-            r.resistance_level,
-            r.anxiety_level,
-            r.morning_thought,
-            r.micro_action,
-            r.day_fact,
-            r.mood_score,
-            r.action_done,
-            r.contact_quality,
-            r.emotion,
-            r.emotion_intensity,
-            r.compassion,
-            r.created_at.isoformat() if getattr(r, "created_at", None) else None,
+            c.id,
+            c.telegram_user_id,
+            c.checkin_date.isoformat() if c.checkin_date else "",
+            c.period.value if hasattr(c.period, "value") else str(c.period),
+            c.sleep_hours if c.sleep_hours is not None else "",
+            c.sleep_quality if c.sleep_quality is not None else "",
+            c.morning_mood if c.morning_mood is not None else "",
+            c.morning_resistance if c.morning_resistance is not None else "",
+            c.morning_anxiety if c.morning_anxiety is not None else "",
+            c.morning_thought or "",
+            c.morning_action_anchor or "",
+            c.evening_mood if c.evening_mood is not None else "",
+            ";".join(c.activity_domains) if c.activity_domains else "",
+            c.action_result or "",
+            c.social_state or "",
+            c.dominant_emotion or "",
+            c.emotion_intensity if c.emotion_intensity is not None else "",
+            c.cognitive_closure or "",
+            c.raw_payload if c.raw_payload is not None else "",
+            c.created_at.isoformat() if c.created_at else "",
         ])
 
     return output.getvalue()
 
 
 async def export_users_csv(session: AsyncSession) -> str:
-    """Генерує CSV-звіт з усіма зареєстрованими користувачами."""
-    stmt = select(User).order_by(User.id.asc())
-    result = await session.execute(stmt)
-    records = result.scalars().all()
+    stmt = select(User).order_by(User.id)
+    res = await session.execute(stmt)
+    users = res.scalars().all()
 
     output = io.StringIO()
-    writer = csv.writer(output)
+    writer = csv.writer(output, dialect="excel")
 
-    headers = ["id", "telegram_user_id", "first_name", "username", "timezone", "is_active", "created_at"]
+    headers = [
+        "id", "telegram_user_id", "first_name", "username",
+        "timezone", "morning_reminder_time", "evening_reminder_time",
+        "is_onboarded", "is_active", "created_at",
+    ]
     writer.writerow(headers)
 
-    for u in records:
+    for u in users:
         writer.writerow([
             u.id,
             u.telegram_user_id,
-            u.first_name,
-            u.username,
+            u.first_name or "",
+            u.username or "",
             u.timezone,
+            getattr(u, "morning_reminder_time", "08:00"),
+            getattr(u, "evening_reminder_time", "22:00"),
+            getattr(u, "is_onboarded", True),
             u.is_active,
-            u.created_at.isoformat() if getattr(u, "created_at", None) else None,
+            u.created_at.isoformat() if u.created_at else "",
+        ])
+
+    return output.getvalue()
+
+
+async def export_user_checkins_csv(session: AsyncSession, telegram_user_id: int) -> str:
+    stmt = (
+        select(DailyCheckin)
+        .where(DailyCheckin.telegram_user_id == telegram_user_id)
+        .order_by(DailyCheckin.checkin_date.desc(), DailyCheckin.period)
+    )
+    res = await session.execute(stmt)
+    checkins = res.scalars().all()
+
+    output = io.StringIO()
+    writer = csv.writer(output, dialect="excel")
+
+    headers = [
+        "checkin_date", "period", "sleep_hours", "sleep_quality",
+        "morning_mood", "morning_resistance", "morning_anxiety",
+        "morning_thought", "morning_action_anchor", "evening_mood",
+        "activity_domains", "action_result", "social_state", "dominant_emotion",
+        "emotion_intensity", "cognitive_closure", "raw_payload", "created_at",
+    ]
+    writer.writerow(headers)
+
+    for c in checkins:
+        writer.writerow([
+            c.checkin_date.isoformat() if c.checkin_date else "",
+            c.period.value if hasattr(c.period, "value") else str(c.period),
+            c.sleep_hours if c.sleep_hours is not None else "",
+            c.sleep_quality if c.sleep_quality is not None else "",
+            c.morning_mood if c.morning_mood is not None else "",
+            c.morning_resistance if c.morning_resistance is not None else "",
+            c.morning_anxiety if c.morning_anxiety is not None else "",
+            c.morning_thought or "",
+            c.morning_action_anchor or "",
+            c.evening_mood if c.evening_mood is not None else "",
+            ";".join(c.activity_domains) if c.activity_domains else "",
+            c.action_result or "",
+            c.social_state or "",
+            c.dominant_emotion or "",
+            c.emotion_intensity if c.emotion_intensity is not None else "",
+            c.cognitive_closure or "",
+            c.raw_payload if c.raw_payload is not None else "",
+            c.created_at.isoformat() if c.created_at else "",
         ])
 
     return output.getvalue()

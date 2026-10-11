@@ -1,24 +1,45 @@
 from aiogram.fsm.state import State, StatesGroup
 
 
+class Onboarding(StatesGroup):
+    """Первинне налаштування графіку та зміна розкладу."""
+    timezone = State()
+    morning_time = State()
+    morning_time_custom = State()
+    evening_time = State()
+    evening_time_custom = State()
+
+
 class MorningCheckin(StatesGroup):
-    sleep_duration = State()     # Скільки спав(-ла)
-    sleep_quality = State()      # Якість сну (1-5)
-    mood = State()               # Настрій зранку (1-5)
-    resistance = State()         # Опір/важкість підйому (1-5)
-    anxiety = State()            # Тривога зранку (1-5)
-    thought = State()            # Перша автоматична думка (кнопка або текст)
-    micro_action = State()       # Мікро-дія на день (кнопка або текст)
+    """Ранковий протокол (6 кроків)."""
+    sleep_hours = State()
+    sleep_hours_custom = State()
+    sleep_quality = State()
+    morning_mood = State()
+    morning_resistance = State()
+    morning_anxiety = State()
+    morning_thought = State()
+    morning_thought_custom = State()
+    morning_action = State()
+    morning_action_custom = State()
 
 
 class EveningCheckin(StatesGroup):
-    day_fact = State()           # Що відбулося (кнопка або текст)
-    mood_score = State()         # Настрій дня (1-5)
-    action_done = State()        # Чи вдалося зробити мікро-дію
-    contact_quality = State()    # Якість контакту з людьми
-    emotion = State()            # Переважна емоція
-    emotion_intensity = State()  # Інтенсивність емоції (1-5)
-    compassion = State()         # Самопідтримка / що сказав би другу
+    """Вечірній протокол (6 кроків)."""
+    activity_domains = State()
+    activity_domains_custom = State()
+    evening_mood = State()
+    action_result = State()
+    social_state = State()
+    social_custom = State()
+    dominant_emotion = State()
+    dominant_emotion_custom = State()
+    emotion_intensity = State()
+    cognitive_closure = State()
+    cognitive_closure_custom = State()
+
 
 class ResetData(StatesGroup):
+    """Підтвердження повного видалення даних."""
     confirm = State()
+

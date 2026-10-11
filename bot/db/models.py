@@ -1,17 +1,20 @@
 import enum
 from datetime import date, datetime
-from typing import Optional, Any
+from typing import List, Optional
+
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Date,
     DateTime,
-    Integer,
-    String,
-    Boolean,
     Enum,
+    Integer,
+    Numeric,
+    String,
+    Text,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from bot.db.base import Base
@@ -30,6 +33,11 @@ class User(Base):
     first_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     username: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     timezone: Mapped[str] = mapped_column(String(50), default="Europe/Warsaw", nullable=False)
+    
+    morning_reminder_time: Mapped[str] = mapped_column(String(5), default="08:00", nullable=False)
+    evening_reminder_time: Mapped[str] = mapped_column(String(5), default="22:00", nullable=False)
+    is_onboarded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -41,6 +49,7 @@ class User(Base):
 class DailyCheckin(Base):
     __tablename__ = "daily_checkins"
 
+    # 🔑 Службові поля (4 поля)
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
     checkin_date: Mapped[date] = mapped_column(Date, index=True, nullable=False)
@@ -49,26 +58,26 @@ class DailyCheckin(Base):
         nullable=False,
     )
 
-    # 🌅 РАНОК
-    sleep_duration_minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # 🌅 Ранок (7 метрик протоколу)
+    sleep_hours: Mapped[Optional[float]] = mapped_column(Numeric(3, 1), nullable=True)
     sleep_quality: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     morning_mood: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    resistance_level: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    anxiety_level: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    morning_thought: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    micro_action: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    morning_resistance: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    morning_anxiety: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    morning_thought: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    morning_action_anchor: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    # 🌙 ВЕЧІР
-    day_fact: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    mood_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    action_done: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
-    contact_quality: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
-    emotion: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    # 🌙 Вечір (7 метрик протоколу)
+    evening_mood: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    activity_domains: Mapped[Optional[List[str]]] = mapped_column(ARRAY(String), nullable=True)
+    action_result: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    social_state: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    dominant_emotion: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     emotion_intensity: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    compassion: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    cognitive_closure: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    # Додатковий контекст
-    raw_payload: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+    # 💾 Аудит-лог та системний час
+    raw_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

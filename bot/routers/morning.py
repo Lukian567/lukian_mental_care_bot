@@ -1,201 +1,379 @@
-import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import date
 from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
+from aiogram.types import Message, CallbackQuery
 
-from bot.config import settings
-from bot.content import stubs
 from bot.db.base import async_session
-from bot.db.repository import save_checkin
+from bot.db.repository import save_morning_checkin, get_user
 from bot.keyboards.checkin_kb import (
-    sleep_duration_kb,
-    scale_kb,
+    sleep_hours_kb,
+    sleep_quality_kb,
+    morning_mood_kb,
+    morning_resistance_kb,
+    morning_anxiety_kb,
     morning_thought_kb,
     morning_action_kb,
 )
 from bot.states.checkin_states import MorningCheckin
 
 router = Router()
-logger = logging.getLogger(__name__)
+
+SLEEP_LABEL_MAP = {
+    "5.5": "< 6 год",
+    "6.5": "6–7 год",
+    "7.5": "7–8 год",
+    "8.5": "8–9 год",
+    "9.5": "> 9 год",
+}
+
+THOUGHT_MAP = {
+    "tasks": "📋 Завдання",
+    "anxiety": "⚡ Тривожні очікування",
+    "rumination": "🔄 Румінація / вчорашнє",
+    "fog": "🌫 Ментальний туман",
+    "calm": "🧘 Спокійна ясна голова",
+    "drive": "🔥 Драйв / очікування",
+}
+
+ACTION_MAP = {
+    "task": "🎯 Закрити ключову робочу/навчальну задачу",
+    "social": "👥 Соціальний контакт / зустріч / дзвінок",
+    "workout": "🏋️ Провести тренування / фізичну активність",
+    "walk": "🚶 Прогулянка / зміна середовища",
+    "order": "🧹 Навести лад у просторі",
+    "rest": "🛋 Свідомо відпочити без почуття провини",
+    "no_plan": "⚪ День без плану / спостереження",
+}
 
 
-# 1. Старт чекіну (/morning) -> Сон
+# -------------------------------------------------------------
+# Крок 1.1: Тривалість сну
+# -------------------------------------------------------------
 @router.message(Command("morning"))
 async def cmd_morning(message: Message, state: FSMContext):
     await state.clear()
-    await state.set_state(MorningCheckin.sleep_duration)
+    await state.set_state(MorningCheckin.sleep_hours)
     await message.answer(
-        stubs.Q_MORNING_SLEEP_DURATION,
-        reply_markup=sleep_duration_kb(),
+        "🌅 **Ранковий протокол (1/6)**\n\n"
+        "Скільки тривав сон?",
+        reply_markup=sleep_hours_kb(),
+        parse_mode="Markdown",
     )
 
 
-# 2. Тривалість сну -> Якість сну
-@router.callback_query(MorningCheckin.sleep_duration, F.data.startswith("sleep_dur:"))
-async def process_sleep_duration(callback: CallbackQuery, state: FSMContext):
-    minutes = int(callback.data.split(":")[1])
-    await state.update_data(sleep_duration_minutes=minutes)
+@router.callback_query(F.data.startswith("sleep_h:"))
+async def process_sleep_hours(callback: CallbackQuery, state: FSMContext):
+    val = callback.data.split(":")[1]
+    if val == "custom":
+        await state.set_state(MorningCheckin.sleep_hours_custom)
+        await callback.message.edit_text(
+            "✍️ Введи точну тривалість сну в годинах (наприклад: `7.5` або `8`):",
+            parse_mode="Markdown",
+        )
+        await callback.answer()
+        return
+
+    hours = float(val)
+    label = SLEEP_LABEL_MAP.get(val, f"{hours} год")
+    await state.update_data(sleep_hours=hours, sleep_display=label)
     await state.set_state(MorningCheckin.sleep_quality)
+
     await callback.message.edit_text(
-        stubs.Q_MORNING_SLEEP_QUALITY,
-        reply_markup=scale_kb("m_sleep_q"),
+        f"✅ Сон: **{label}**\n\n"
+        "Яка суб'єктивна якість сну?\n\n"
+        "(1 — поганий / не відновлювальний\n 5 — повністю відновився ⚡)",
+        reply_markup=sleep_quality_kb(),
+        parse_mode="Markdown",
     )
     await callback.answer()
 
 
-# 3. Якість сну -> Настрій
-@router.callback_query(MorningCheckin.sleep_quality, F.data.startswith("m_sleep_q:"))
-async def process_sleep_quality(callback: CallbackQuery, state: FSMContext):
-    score = int(callback.data.split(":")[1])
-    await state.update_data(sleep_quality=score)
-    await state.set_state(MorningCheckin.mood)
-    await callback.message.edit_text(
-        stubs.Q_MORNING_MOOD,
-        reply_markup=scale_kb("m_mood"),
-    )
-    await callback.answer()
-
-
-# 4. Настрій -> Опір/важкість підйому
-@router.callback_query(MorningCheckin.mood, F.data.startswith("m_mood:"))
-async def process_morning_mood(callback: CallbackQuery, state: FSMContext):
-    score = int(callback.data.split(":")[1])
-    await state.update_data(morning_mood=score)
-    await state.set_state(MorningCheckin.resistance)
-    await callback.message.edit_text(
-        stubs.Q_MORNING_RESISTANCE,
-        reply_markup=scale_kb("m_resist"),
-    )
-    await callback.answer()
-
-
-# 5. Опір -> Тривожність
-@router.callback_query(MorningCheckin.resistance, F.data.startswith("m_resist:"))
-async def process_resistance(callback: CallbackQuery, state: FSMContext):
-    score = int(callback.data.split(":")[1])
-    await state.update_data(resistance_level=score)
-    await state.set_state(MorningCheckin.anxiety)
-    await callback.message.edit_text(
-        stubs.Q_MORNING_ANXIETY,
-        reply_markup=scale_kb("m_anxiety"),
-    )
-    await callback.answer()
-
-
-# 6. Тривожність -> Автоматична думка
-@router.callback_query(MorningCheckin.anxiety, F.data.startswith("m_anxiety:"))
-async def process_anxiety(callback: CallbackQuery, state: FSMContext):
-    score = int(callback.data.split(":")[1])
-    await state.update_data(anxiety_level=score)
-    await state.set_state(MorningCheckin.thought)
-    await callback.message.edit_text(
-        stubs.Q_MORNING_THOUGHT,
-        reply_markup=morning_thought_kb(),
-    )
-    await callback.answer()
-
-
-# 7. Думка (вибір кнопки)
-@router.callback_query(MorningCheckin.thought, F.data.startswith("thought:"))
-async def process_thought_btn(callback: CallbackQuery, state: FSMContext):
-    action = callback.data.split(":")[1]
-
-    if action == "custom":
-        await callback.message.edit_text("Напиши свою першу думку повідомленням:")
-        await callback.answer()
+@router.message(MorningCheckin.sleep_hours_custom, ~F.text.startswith("/"))
+async def process_sleep_hours_custom(message: Message, state: FSMContext):
+    text = message.text.strip().replace(",", ".")
+    try:
+        hours = float(text)
+        if not (1.0 <= hours <= 24.0):
+            raise ValueError
+    except ValueError:
+        await message.answer("⚠️ Будь ласка, введи коректне число від 1 до 24 (наприклад, 7.5):")
         return
 
-    thought_map = {
-        "again": stubs.THOUGHT_AGAIN,
-        "nothing": stubs.THOUGHT_NOTHING,
-        "better": stubs.THOUGHT_BETTER,
-        "task": stubs.THOUGHT_TASK,
-        "neutral": stubs.THOUGHT_NEUTRAL,
-        "skip": "Пропущено",
-    }
-    await state.update_data(morning_thought=thought_map.get(action, action))
-    await state.set_state(MorningCheckin.micro_action)
-    await callback.message.edit_text(
-        stubs.Q_MORNING_MICRO_ACTION,
-        reply_markup=morning_action_kb(),
-    )
-    await callback.answer()
-
-
-# 7а. Думка (текстом)
-@router.message(MorningCheckin.thought)
-async def process_thought_text(message: Message, state: FSMContext):
-    await state.update_data(morning_thought=message.text)
-    await state.set_state(MorningCheckin.micro_action)
+    label = f"{hours} год"
+    await state.update_data(sleep_hours=hours, sleep_display=label)
+    await state.set_state(MorningCheckin.sleep_quality)
     await message.answer(
-        stubs.Q_MORNING_MICRO_ACTION,
-        reply_markup=morning_action_kb(),
+        f"✅ Сон: **{label}**\n\n"
+        "Яка суб'єктивна якість сну?\n\n"
+        "(1 — поганий / не відновлювальний\n 5 — повністю відновився ⚡)",
+        reply_markup=sleep_quality_kb(),
+        parse_mode="Markdown",
     )
 
 
-# 8. Фінал: Мікро-дія (вибір кнопки)
-@router.callback_query(MorningCheckin.micro_action, F.data.startswith("action:"))
-async def process_action_btn(callback: CallbackQuery, state: FSMContext):
-    action = callback.data.split(":")[1]
+# -------------------------------------------------------------
+# Крок 1.2: Якість сну -> Крок 2: Ранковий настрій
+# -------------------------------------------------------------
+@router.callback_query(F.data.startswith("sleep_q:"))
+async def process_sleep_quality(callback: CallbackQuery, state: FSMContext):
+    q = int(callback.data.split(":")[1])
+    await state.update_data(sleep_quality=q)
+    await state.set_state(MorningCheckin.morning_mood)
 
-    if action == "custom":
-        await callback.message.edit_text("Напиши свою мікро-дію на сьогодні повідомленням:")
+    await callback.message.edit_text(
+        "🌅 **Ранковий протокол (2/6)**\n\n"
+        "Який емоційний стан на старті дня?\n\n"
+        "(1 — важкий / пригнічений 📉\n 5 — ресурсний / піднесений 🚀)",
+        reply_markup=morning_mood_kb(),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+# -------------------------------------------------------------
+# Крок 2 -> Крок 3: Рівень внутрішнього опору
+# -------------------------------------------------------------
+@router.callback_query(F.data.startswith("m_mood:"))
+async def process_morning_mood(callback: CallbackQuery, state: FSMContext):
+    mood = int(callback.data.split(":")[1])
+    await state.update_data(morning_mood=mood)
+    await state.set_state(MorningCheckin.morning_resistance)
+
+    await callback.message.edit_text(
+        "🌅 **Ранковий протокол (3/6)**\n\n"
+        "Наскільки важко було зібрати сили та розпочати день?\n\n"
+        "(1 — взагалі без зусиль 🟢\n 5 — колосальний опір 🛑)",
+        reply_markup=morning_resistance_kb(),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+# -------------------------------------------------------------
+# Крок 3 -> Крок 4: Фонова тривожність
+# -------------------------------------------------------------
+@router.callback_query(F.data.startswith("m_res:"))
+async def process_morning_resistance(callback: CallbackQuery, state: FSMContext):
+    res = int(callback.data.split(":")[1])
+    await state.update_data(morning_resistance=res)
+    await state.set_state(MorningCheckin.morning_anxiety)
+
+    await callback.message.edit_text(
+        "🌅 **Ранковий протокол (4/6)**\n\n"
+        "Рівень внутрішнього напруження або тривоги:\n\n"
+        "(1 — спокій / відсутність тривоги 🧘\n 5 — висока тривожність / напруга ⚡)",
+        reply_markup=morning_anxiety_kb(),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+# -------------------------------------------------------------
+# Крок 4 -> Крок 5: Ранкова думка (Когнітивний фокус)
+# -------------------------------------------------------------
+@router.callback_query(F.data.startswith("m_anx:"))
+async def process_morning_anxiety(callback: CallbackQuery, state: FSMContext):
+    anx = int(callback.data.split(":")[1])
+    await state.update_data(morning_anxiety=anx)
+    await state.set_state(MorningCheckin.morning_thought)
+
+    await callback.message.edit_text(
+        "🌅 **Ранковий протокол (5/6)**\n\n"
+        "Яка головна думка або фокус уваги зараз у голові?\n\n"
+        "(Обери варіант нижче або напиши свій текстом)",
+        reply_markup=morning_thought_kb(),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+# -------------------------------------------------------------
+# Крок 5: Обробка кнопок думок
+# -------------------------------------------------------------
+@router.callback_query(F.data.startswith("thought_p:"))
+async def process_thought_pattern(callback: CallbackQuery, state: FSMContext):
+    val = callback.data.split(":")[1]
+
+    if val == "custom":
+        await state.set_state(MorningCheckin.morning_thought_custom)
+        await callback.message.edit_text("✍️ Запиши коротко свою головну думку на старті дня:", parse_mode="Markdown")
         await callback.answer()
         return
 
-    action_map = {
-        "self_care": stubs.ACTION_SELF_CARE,
-        "walk": stubs.ACTION_WALK,
-        "work": stubs.ACTION_STUDY_WORK,
-        "survive": stubs.ACTION_SURVIVE,
-        "skip": "Без плану",
-    }
-    await state.update_data(micro_action=action_map.get(action, action))
+    thought_val = None if val == "skip" else THOUGHT_MAP.get(val, val)
+    await state.update_data(morning_thought=thought_val)
+    await state.set_state(MorningCheckin.morning_action)
+
+    await callback.message.edit_text(
+        "🌅 **Ранковий протокол (6/6)**\n\n"
+        "Обери один конкретний фокус / мікро-дію на день:",
+        reply_markup=morning_action_kb(),
+        parse_mode="Markdown",
+    )
     await callback.answer()
-    
-    # Редагуємо повідомлення на фінальне
+
+
+@router.message(MorningCheckin.morning_thought, ~F.text.startswith("/"))
+@router.message(MorningCheckin.morning_thought_custom, ~F.text.startswith("/"))
+async def process_thought_text(message: Message, state: FSMContext):
+    thought = message.text.strip()
+    await state.update_data(morning_thought=thought)
+    await state.set_state(MorningCheckin.morning_action)
+
+    await message.answer(
+        "🌅 **Ранковий протокол (6/6)**\n\n"
+        "Обери один конкретний фокус / мікро-дію на день:",
+        reply_markup=morning_action_kb(),
+        parse_mode="Markdown",
+    )
+
+
+# -------------------------------------------------------------
+# Крок 6: Поведінковий якір дня + Фінал
+# -------------------------------------------------------------
+async def complete_morning_checkin(target, state: FSMContext, anchor_text: str):
+    data = await state.get_data()
+    user_id = target.from_user.id
+    today = date.today()
+
+    thought_val = data.get("morning_thought")
+    sleep_display = data.get("sleep_display") or f"{data.get('sleep_hours', 7.0)} год"
+
+    evening_time = None
     try:
-        data = await state.get_data()
-        today = datetime.now(ZoneInfo(settings.timezone)).date()
-
         async with async_session() as session:
-            await save_checkin(
+            await save_morning_checkin(
                 session=session,
-                user_id=callback.from_user.id,
+                telegram_user_id=user_id,
                 checkin_date=today,
-                period="morning",
-                data=data,
+                sleep_hours=data.get("sleep_hours", 7.0),
+                sleep_quality=data.get("sleep_quality", 3),
+                morning_mood=data.get("morning_mood", 3),
+                morning_resistance=data.get("morning_resistance", 1),
+                morning_anxiety=data.get("morning_anxiety", 1),
+                morning_thought_pattern="Думка" if thought_val else None,
+                morning_thought_custom=thought_val,
+                morning_action_anchor=anchor_text,
+                raw_payload=data,
             )
-
-        await state.clear()
-        await callback.message.edit_text(stubs.MORNING_COMPLETE_MSG)
+            user_obj = await get_user(session, user_id)
+            if user_obj and getattr(user_obj, "evening_reminder_time", None):
+                evening_time = user_obj.evening_reminder_time
     except Exception as e:
-        logger.exception("Помилка збереження ранкового чекіну: %s", e)
-        await callback.message.answer(f"Помилка при збереженні: {e}")
+        print("Save morning checkin error:", e)
+
+    await state.clear()
+
+    farewell = (
+        f"До зустрічі під час вечірнього протоколу о **{evening_time}**! 🚀"
+        if evening_time
+        else "До зустрічі під час вечірнього підсумку! 🚀"
+    )
+
+    summary_text = (
+        "✨ **Ранковий протокол збережено!**\n\n"
+        f"• Сон: **{sleep_display}** (якість: {data.get('sleep_quality')}/5)\n"
+        f"• Настрій: **{data.get('morning_mood')}/5** | Опір: **{data.get('morning_resistance')}/5**\n"
+        f"• Тривожність: **{data.get('morning_anxiety')}/5**\n"
+        f"• Думка: **{thought_val or '—'}**\n"
+        f"• Якір дня: **{anchor_text}**\n\n"
+        f"Вдалого дня! {farewell}"
+    )
+
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(summary_text, parse_mode="Markdown")
+        await target.answer()
+    else:
+        await target.answer(summary_text, parse_mode="Markdown")
 
 
-# 8а. Фінал: Мікро-дія (текстом)
-@router.message(MorningCheckin.micro_action)
-async def process_action_text(message: Message, state: FSMContext):
-    await state.update_data(micro_action=message.text)
-    try:
-        data = await state.get_data()
-        today = datetime.now(ZoneInfo(settings.timezone)).date()
+@router.callback_query(F.data.startswith("anchor:"))
+async def process_morning_action(callback: CallbackQuery, state: FSMContext):
+    val = callback.data.split(":")[1]
 
-        async with async_session() as session:
-            await save_checkin(
-                session=session,
-                user_id=message.from_user.id,
-                checkin_date=today,
-                period="morning",
-                data=data,
-            )
+    if val == "custom":
+        await state.set_state(MorningCheckin.morning_action_custom)
+        await callback.message.edit_text("✍️ Напиши свою конкретну дію на день:", parse_mode="Markdown")
+        await callback.answer()
+        return
 
-        await state.clear()
-        await message.answer(stubs.MORNING_COMPLETE_MSG)
-    except Exception as e:
-        logger.exception("Помилка збереження ранкового чекіну: %s", e)
-        await message.answer(f"Помилка при збереженні: {e}")
+    anchor_text = ACTION_MAP.get(val, "⚪ День без плану / спостереження")
+    await complete_morning_checkin(callback, state, anchor_text)
+
+
+@router.message(MorningCheckin.morning_action_custom, ~F.text.startswith("/"))
+async def process_morning_action_custom(message: Message, state: FSMContext):
+    anchor_text = message.text.strip()
+    await complete_morning_checkin(message, state, anchor_text)
+
+
+# -------------------------------------------------------------
+# Обробник універсального повернення «« Назад» на 1 крок
+# -------------------------------------------------------------
+@router.callback_query(F.data.startswith("m_back:"))
+async def process_morning_back(callback: CallbackQuery, state: FSMContext):
+    target_step = callback.data.split(":")[1]
+    data = await state.get_data()
+
+    if target_step == "1":
+        await state.set_state(MorningCheckin.sleep_hours)
+        await callback.message.edit_text(
+            "🌅 **Ранковий протокол (1/6)**\n\n"
+            "Скільки тривав сон?",
+            reply_markup=sleep_hours_kb(),
+            parse_mode="Markdown",
+        )
+
+    elif target_step == "2":
+        await state.set_state(MorningCheckin.sleep_quality)
+        label = data.get("sleep_display") or f"{data.get('sleep_hours', 7.0)} год"
+        await callback.message.edit_text(
+            f"✅ Сон: **{label}**\n\n"
+            "Яка суб'єктивна якість сну?\n\n"
+            "(1 — поганий / не відновлювальний\n 5 — повністю відновився ⚡)",
+            reply_markup=sleep_quality_kb(),
+            parse_mode="Markdown",
+        )
+
+    elif target_step == "3":
+        await state.set_state(MorningCheckin.morning_mood)
+        await callback.message.edit_text(
+            "🌅 **Ранковий протокол (2/6)**\n\n"
+            "Який емоційний стан на старті дня?\n\n"
+            "(1 — важкий / пригнічений 📉\n 5 — ресурсний / піднесений 🚀)",
+            reply_markup=morning_mood_kb(),
+            parse_mode="Markdown",
+        )
+
+    elif target_step == "4":
+        await state.set_state(MorningCheckin.morning_resistance)
+        await callback.message.edit_text(
+            "🌅 **Ранковий протокол (3/6)**\n\n"
+            "Наскільки важко було зібрати сили та розпочати день?\n\n"
+            "(1 — взагалі без зусиль 🟢\n 5 — колосальний опір 🛑)",
+            reply_markup=morning_resistance_kb(),
+            parse_mode="Markdown",
+        )
+
+    elif target_step == "5":
+        await state.set_state(MorningCheckin.morning_anxiety)
+        await callback.message.edit_text(
+            "🌅 **Ранковий протокол (4/6)**\n\n"
+            "Рівень внутрішнього напруження або тривоги:\n\n"
+            "(1 — спокій / відсутність тривоги 🧘\n 5 — висока тривожність / напруга ⚡)",
+            reply_markup=morning_anxiety_kb(),
+            parse_mode="Markdown",
+        )
+
+    elif target_step == "6":
+        await state.set_state(MorningCheckin.morning_thought)
+        await callback.message.edit_text(
+            "🌅 **Ранковий протокол (5/6)**\n\n"
+            "Яка головна думка або фокус уваги зараз у голові?\n\n"
+            "(Обери варіант нижче або напиши свій текстом)",
+            reply_markup=morning_thought_kb(),
+            parse_mode="Markdown",
+        )
+
+    await callback.answer()
