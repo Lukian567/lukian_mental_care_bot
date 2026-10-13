@@ -1,3 +1,4 @@
+import html
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -8,6 +9,9 @@ from apscheduler.triggers.cron import CronTrigger
 
 from bot.db.base import async_session
 from bot.db.repository import get_users_for_reminder
+
+from bot.config import settings
+from bot.sheets_sync import sync_journal_to_sheets
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +122,22 @@ async def check_and_send_scheduled_reminders(bot: Bot):
                 e,
             )
 
+async def scheduled_sheets_sync(bot: Bot):
+    """Щоденне оновлення Google Sheets даними з бази."""
+    if not (settings.google_credentials_path and settings.google_sheet_id):
+        return  # синхронізація не налаштована
+    try:
+        n = await sync_journal_to_sheets()
+        logger.info("Автосинхронізація Google Sheets: %s днів", n)
+    except Exception as e:
+        logger.error("Автосинхронізація Google Sheets не вдалася: %s", e)
+        try:
+            await bot.send_message(
+                settings.admin_user_id,
+                f"⚠️ Автосинхронізація Google Sheets не вдалася: {html.escape(str(e)[:300])}",
+            )
+        except Exception:
+            pass
 
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     """Ініціалізує та конфігурує задачі планувальника."""
@@ -129,6 +149,15 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         args=[bot],
         id="check_dynamic_reminders",
         replace_existing=True,
+    )
+
+    scheduler.add_job(
+        scheduled_sheets_sync,
+        trigger=CronTrigger(hour=23, minute=55, timezone=settings.timezone),
+        args=[bot],
+        id="sync_google_sheets_daily",
+        replace_existing=True,
+        misfire_grace_time=3600,
     )
 
     return scheduler
