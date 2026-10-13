@@ -1,3 +1,4 @@
+import html
 import re
 from datetime import date
 from typing import Union, Optional
@@ -9,6 +10,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.config import settings
 from bot.db.base import async_session
+from bot.sheets_sync import sync_journal_to_sheets
+
 from bot.db.repository import (
     register_or_update_user,
     get_user,
@@ -596,3 +599,15 @@ async def cb_confirm_reset(callback: CallbackQuery, state: FSMContext):
         parse_mode="Markdown",
     )
     await callback.answer()
+
+@router.message(Command("sync"))
+async def cmd_sync(message: Message):
+    """Ручне оновлення Google Sheets (тільки для власника бота)."""
+    if not is_admin_user(message.from_user.id):
+        return
+    await message.answer("⏳ Оновлюю Google Sheets…")
+    try:
+        n = await sync_journal_to_sheets()
+        await message.answer(f"✅ Google Sheets оновлено: {n} днів")
+    except Exception as e:
+        await message.answer(f"⚠️ Помилка синхронізації: {html.escape(str(e)[:300])}")
